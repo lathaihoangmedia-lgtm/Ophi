@@ -514,6 +514,18 @@ impl OpenFangKernel {
             config.api_listen = listen;
         }
 
+        // OPENFANG_API_KEY: env var sets the API authentication key when
+        // config.toml doesn't already have one.  Config file takes precedence.
+        if config.api_key.trim().is_empty() {
+            if let Ok(key) = std::env::var("OPENFANG_API_KEY") {
+                let key = key.trim().to_string();
+                if !key.is_empty() {
+                    info!("Using API key from OPENFANG_API_KEY environment variable");
+                    config.api_key = key;
+                }
+            }
+        }
+
         // Clamp configuration bounds to prevent zero-value or unbounded misconfigs
         config.clamp_bounds();
 
@@ -1377,7 +1389,7 @@ impl OpenFangKernel {
             .get()
             .and_then(|w| w.upgrade())
             .map(|arc| arc as Arc<dyn KernelHandle>);
-        self.send_message_with_handle(agent_id, message, handle)
+        self.send_message_with_handle(agent_id, message, handle, None, None)
             .await
     }
 
@@ -1396,7 +1408,7 @@ impl OpenFangKernel {
             .get()
             .and_then(|w| w.upgrade())
             .map(|arc| arc as Arc<dyn KernelHandle>);
-        self.send_message_with_handle_and_blocks(agent_id, message, handle, Some(blocks))
+        self.send_message_with_handle_and_blocks(agent_id, message, handle, Some(blocks), None, None)
             .await
     }
 
@@ -1406,8 +1418,10 @@ impl OpenFangKernel {
         agent_id: AgentId,
         message: &str,
         kernel_handle: Option<Arc<dyn KernelHandle>>,
+        sender_id: Option<String>,
+        sender_name: Option<String>,
     ) -> KernelResult<AgentLoopResult> {
-        self.send_message_with_handle_and_blocks(agent_id, message, kernel_handle, None)
+        self.send_message_with_handle_and_blocks(agent_id, message, kernel_handle, None, sender_id, sender_name)
             .await
     }
 
@@ -1426,6 +1440,8 @@ impl OpenFangKernel {
         message: &str,
         kernel_handle: Option<Arc<dyn KernelHandle>>,
         content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
+        sender_id: Option<String>,
+        sender_name: Option<String>,
     ) -> KernelResult<AgentLoopResult> {
         // Acquire per-agent lock to serialize concurrent messages for the same agent.
         // This prevents session corruption when multiple messages arrive in quick
@@ -1455,7 +1471,7 @@ impl OpenFangKernel {
             self.execute_python_agent(&entry, agent_id, message).await
         } else {
             // Default: LLM agent loop (builtin:chat or any unrecognized module)
-            self.execute_llm_agent(&entry, agent_id, message, kernel_handle, content_blocks)
+            self.execute_llm_agent(&entry, agent_id, message, kernel_handle, content_blocks, sender_id, sender_name)
                 .await
         };
 
@@ -1510,6 +1526,8 @@ impl OpenFangKernel {
         agent_id: AgentId,
         message: &str,
         kernel_handle: Option<Arc<dyn KernelHandle>>,
+        sender_id: Option<String>,
+        sender_name: Option<String>,
     ) -> KernelResult<(
         tokio::sync::mpsc::Receiver<StreamEvent>,
         tokio::task::JoinHandle<KernelResult<AgentLoopResult>>,
@@ -1590,7 +1608,7 @@ impl OpenFangKernel {
                 label: None,
             });
 
-        // Check if auto-compaction is needed: message-count OR token-count trigger
+        // Check if auto-compaction is needed: message-count OR token-count OR quota-headroom trigger
         let needs_compact = {
             use openfang_runtime::compactor::{
                 estimate_token_count, needs_compaction as check_compact,
@@ -1612,7 +1630,23 @@ impl OpenFangKernel {
                     "Token-based compaction triggered (messages below threshold but tokens above)"
                 );
             }
-            by_messages || by_tokens
+            let by_quota = if let Some(headroom) = self.scheduler.token_headroom(agent_id) {
+                let threshold = (headroom as f64 * 0.8) as u64;
+                if estimated as u64 > threshold && session.messages.len() > 4 {
+                    info!(
+                        agent_id = %agent_id,
+                        estimated_tokens = estimated,
+                        quota_headroom = headroom,
+                        "Quota-headroom compaction triggered (session would consume >80% of remaining quota)"
+                    );
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            by_messages || by_tokens || by_quota
         };
 
         let tools = self.available_tools(agent_id);
@@ -1731,6 +1765,8 @@ impl OpenFangKernel {
                 },
                 peer_agents,
                 current_date: Some(chrono::Local::now().format("%A, %B %d, %Y (%Y-%m-%d %H:%M %Z)").to_string()),
+                sender_id,
+                sender_name,
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -2057,6 +2093,7 @@ impl OpenFangKernel {
     }
 
     /// Execute the default LLM-based agent loop.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_llm_agent(
         &self,
         entry: &AgentEntry,
@@ -2064,6 +2101,8 @@ impl OpenFangKernel {
         message: &str,
         kernel_handle: Option<Arc<dyn KernelHandle>>,
         content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
+        sender_id: Option<String>,
+        sender_name: Option<String>,
     ) -> KernelResult<AgentLoopResult> {
         // Check metering quota before starting
         self.metering
@@ -2081,6 +2120,42 @@ impl OpenFangKernel {
                 context_window_tokens: 0,
                 label: None,
             });
+
+        // Pre-emptive compaction: compact before LLM call if session is large or quota headroom is low
+        {
+            use openfang_runtime::compactor::{
+                estimate_token_count, needs_compaction as check_compact,
+                needs_compaction_by_tokens, CompactionConfig,
+            };
+            let config = CompactionConfig::default();
+            let by_messages = check_compact(&session, &config);
+            let estimated = estimate_token_count(
+                &session.messages,
+                Some(&entry.manifest.model.system_prompt),
+                None,
+            );
+            let by_tokens = needs_compaction_by_tokens(estimated, &config);
+            let by_quota = if let Some(headroom) = self.scheduler.token_headroom(agent_id) {
+                let threshold = (headroom as f64 * 0.8) as u64;
+                estimated as u64 > threshold && session.messages.len() > 4
+            } else {
+                false
+            };
+            if by_messages || by_tokens || by_quota {
+                info!(agent_id = %agent_id, messages = session.messages.len(), estimated_tokens = estimated, "Pre-emptive compaction before LLM call");
+                match self.compact_agent_session(agent_id).await {
+                    Ok(msg) => {
+                        info!(agent_id = %agent_id, "{msg}");
+                        if let Ok(Some(reloaded)) = self.memory.get_session(session.id) {
+                            session = reloaded;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(agent_id = %agent_id, "Pre-emptive compaction failed: {e}");
+                    }
+                }
+            }
+        }
 
         let messages_before = session.messages.len();
 
@@ -2202,6 +2277,8 @@ impl OpenFangKernel {
                 },
                 peer_agents,
                 current_date: Some(chrono::Local::now().format("%A, %B %d, %Y (%Y-%m-%d %H:%M %Z)").to_string()),
+                sender_id,
+                sender_name,
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -3518,6 +3595,49 @@ impl OpenFangKernel {
         Ok((run_id, output))
     }
 
+    /// Auto-load workflow definitions from a directory.
+    ///
+    /// Scans the given directory for `.json` files, deserializes each as a
+    /// `Workflow`, and registers it. Invalid files are skipped with a warning.
+    pub async fn load_workflows_from_dir(&self, dir: &std::path::Path) -> usize {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(path = ?dir, error = %e, "Failed to read workflows directory");
+                }
+                return 0;
+            }
+        };
+
+        let mut count = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(path = ?path, error = %e, "Failed to read workflow file");
+                    continue;
+                }
+            };
+            match serde_json::from_str::<Workflow>(&content) {
+                Ok(wf) => {
+                    let name = wf.name.clone();
+                    let wf_id = self.register_workflow(wf).await;
+                    tracing::info!(path = ?path, id = %wf_id, name = %name, "Auto-loaded workflow");
+                    count += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(path = ?path, error = %e, "Invalid workflow JSON, skipping");
+                }
+            }
+        }
+        count
+    }
+
     /// Start background loops for all non-reactive agents.
     ///
     /// Must be called after the kernel is wrapped in `Arc` (e.g., from the daemon).
@@ -3743,6 +3863,24 @@ impl OpenFangKernel {
             });
         }
 
+        // Auto-load workflow definitions from configured directory
+        {
+            let wf_dir = self
+                .config
+                .workflows_dir
+                .clone()
+                .unwrap_or_else(|| self.config.home_dir.join("workflows"));
+            if wf_dir.exists() {
+                let kernel = Arc::clone(self);
+                tokio::spawn(async move {
+                    let count = kernel.load_workflows_from_dir(&wf_dir).await;
+                    if count > 0 {
+                        info!("Auto-loaded {count} workflow(s) from {}", wf_dir.display());
+                    }
+                });
+            }
+        }
+
         // Cron scheduler tick loop — fires due jobs every 15 seconds
         {
             let kernel = Arc::clone(self);
@@ -3795,7 +3933,7 @@ impl OpenFangKernel {
                                 let kh: std::sync::Arc<dyn openfang_runtime::kernel_handle::KernelHandle> = kernel.clone();
                                 match tokio::time::timeout(
                                     timeout,
-                                    kernel.send_message_with_handle(agent_id, message, Some(kh)),
+                                    kernel.send_message_with_handle(agent_id, message, Some(kh), None, None),
                                 )
                                 .await
                                 {
@@ -3821,6 +3959,64 @@ impl OpenFangKernel {
                                         kernel.cron_scheduler.record_failure(
                                             job_id,
                                             &format!("timed out after {timeout_s}s"),
+                                        );
+                                    }
+                                }
+                            }
+                            openfang_types::scheduler::CronAction::WorkflowRun {
+                                workflow_id,
+                                input,
+                                timeout_secs,
+                            } => {
+                                tracing::debug!(job = %job_name, workflow = %workflow_id, "Cron: firing workflow run");
+                                let wf_input = input.clone().unwrap_or_default();
+                                let timeout_s = timeout_secs.unwrap_or(120);
+                                let timeout = std::time::Duration::from_secs(timeout_s);
+                                let delivery = job.delivery.clone();
+
+                                // Resolve workflow: try UUID first, then name
+                                let wf_id = match uuid::Uuid::parse_str(workflow_id) {
+                                    Ok(uuid) => crate::workflow::WorkflowId(uuid),
+                                    Err(_) => {
+                                        let all_wfs = kernel.workflows.list_workflows().await;
+                                        if let Some(wf) = all_wfs.iter().find(|w| w.name == *workflow_id) {
+                                            wf.id
+                                        } else {
+                                            let err_msg = format!("workflow not found: {workflow_id}");
+                                            tracing::warn!(job = %job_name, %err_msg);
+                                            kernel.cron_scheduler.record_failure(job_id, &err_msg);
+                                            continue;
+                                        }
+                                    }
+                                };
+
+                                match tokio::time::timeout(
+                                    timeout,
+                                    kernel.run_workflow(wf_id, wf_input),
+                                )
+                                .await
+                                {
+                                    Ok(Ok((_run_id, output))) => {
+                                        tracing::info!(job = %job_name, "Cron workflow completed");
+                                        kernel.cron_scheduler.record_success(job_id);
+                                        cron_deliver_response(
+                                            &kernel,
+                                            agent_id,
+                                            &output,
+                                            &delivery,
+                                        )
+                                        .await;
+                                    }
+                                    Ok(Err(e)) => {
+                                        let err_msg = format!("{e}");
+                                        tracing::warn!(job = %job_name, error = %err_msg, "Cron workflow failed");
+                                        kernel.cron_scheduler.record_failure(job_id, &err_msg);
+                                    }
+                                    Err(_) => {
+                                        tracing::warn!(job = %job_name, timeout_s, "Cron workflow timed out");
+                                        kernel.cron_scheduler.record_failure(
+                                            job_id,
+                                            &format!("workflow timed out after {timeout_s}s"),
                                         );
                                     }
                                 }
@@ -5622,6 +5818,14 @@ impl KernelHandle for OpenFangKernel {
             .iter()
             .find(|(_, card)| card.name.to_lowercase() == name_lower)
             .map(|(_, card)| card.url.clone())
+    }
+
+    async fn get_channel_default_recipient(&self, channel: &str) -> Option<String> {
+        match channel {
+            "telegram" => self.config.channels.telegram.as_ref()?.default_chat_id.clone(),
+            "discord" => self.config.channels.discord.as_ref()?.default_channel_id.clone(),
+            _ => None,
+        }
     }
 
     async fn send_channel_message(

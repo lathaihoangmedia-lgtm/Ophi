@@ -16,7 +16,7 @@ use futures::StreamExt;
 use openfang_types::agent::AgentId;
 use openfang_types::config::{ChannelOverrides, DmPolicy, GroupPolicy, OutputFormat};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
@@ -291,6 +291,11 @@ impl BridgeManager {
         }
     }
 
+    /// Return a reference to the underlying agent router.
+    pub fn router(&self) -> &Arc<AgentRouter> {
+        &self.router
+    }
+
     /// Start an adapter: subscribe to its message stream and spawn a dispatch task.
     ///
     /// Each incoming message is dispatched as a concurrent task so that slow LLM
@@ -342,6 +347,7 @@ impl BridgeManager {
                                         &handle,
                                         &router,
                                         adapter.as_ref(),
+                                        &adapter,
                                         &rate_limiter,
                                     ).await;
                                 });
@@ -434,6 +440,24 @@ async fn send_lifecycle_reaction(
     let _ = adapter.send_reaction(user, message_id, &reaction).await;
 }
 
+/// Spawn a background task that refreshes the typing indicator every 4 seconds.
+///
+/// Returns a `JoinHandle` that should be aborted once the LLM call completes.
+/// Telegram (and similar platforms) expire typing indicators after ~5 seconds,
+/// so refreshing at 4-second intervals keeps the indicator alive for the entire
+/// duration of long LLM calls.
+fn spawn_typing_loop(
+    adapter: Arc<dyn ChannelAdapter>,
+    sender: ChannelUser,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            let _ = adapter.send_typing(&sender).await;
+        }
+    })
+}
+
 /// Dispatch a single incoming message — handles bot commands or routes to an agent.
 ///
 /// Applies per-channel policies (DM/group filtering, rate limiting, formatting, threading).
@@ -442,6 +466,7 @@ async fn dispatch_message(
     handle: &Arc<dyn ChannelBridgeHandle>,
     router: &Arc<AgentRouter>,
     adapter: &dyn ChannelAdapter,
+    adapter_arc: &Arc<dyn ChannelAdapter>,
     rate_limiter: &ChannelRateLimiter,
 ) {
     let ct_str = channel_type_str(&message.channel);
@@ -458,6 +483,7 @@ async fn dispatch_message(
         .and_then(|o| o.output_format)
         .unwrap_or(channel_default_format);
     let threading_enabled = overrides.as_ref().map(|o| o.threading).unwrap_or(false);
+    let lifecycle_reactions = overrides.as_ref().map(|o| o.lifecycle_reactions).unwrap_or(true);
     let thread_id = if threading_enabled {
         message.thread_id.as_deref()
     } else {
@@ -539,9 +565,11 @@ async fn dispatch_message(
                 handle,
                 router,
                 adapter,
+                adapter_arc,
                 ct_str,
                 thread_id,
                 output_format,
+                lifecycle_reactions,
             )
             .await;
             return;
@@ -641,6 +669,8 @@ async fn dispatch_message(
             }
             let _ = adapter.send_typing(&message.sender).await;
 
+            let typing_task = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
+
             let strategy = router.broadcast_strategy();
             let mut responses = Vec::new();
 
@@ -679,6 +709,8 @@ async fn dispatch_message(
                     }
                 }
             }
+
+            typing_task.abort();
 
             let combined = responses.join("\n\n");
             send_response(adapter, &message.sender, combined, thread_id, output_format).await;
@@ -757,22 +789,37 @@ async fn dispatch_message(
 
     // Lifecycle reaction: ⏳ Queued → 🤔 Thinking → ✅ Done / ❌ Error
     let msg_id = &message.platform_message_id;
-    send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Queued).await;
-    send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Thinking).await;
+    if lifecycle_reactions {
+        send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Queued).await;
+        send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Thinking).await;
+    }
+
+    // Continuous typing indicator — refreshes every 4s so platforms like Telegram
+    // (which expire typing after ~5s) keep showing it during long LLM calls.
+    let typing_task = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
 
     // Send to agent and relay response
-    match handle.send_message(agent_id, &text).await {
+    let result = handle.send_message(agent_id, &text).await;
+
+    // Stop the typing refresh now that we have a response
+    typing_task.abort();
+
+    match result {
         Ok(response) => {
-            send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Done).await;
+            if lifecycle_reactions {
+                send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Done).await;
+            }
             send_response(adapter, &message.sender, response, thread_id, output_format).await;
             handle
                 .record_delivery(agent_id, ct_str, &message.sender.platform_id, true, None, thread_id)
                 .await;
         }
         Err(e) => {
-            send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Error).await;
+            if lifecycle_reactions {
+                send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Error).await;
+            }
             warn!("Agent error for {agent_id}: {e}");
-            let err_msg = format!("Agent error: {e}");
+            let err_msg = sanitize_agent_error(&e.to_string());
             send_response(
                 adapter,
                 &message.sender,
@@ -793,6 +840,76 @@ async fn dispatch_message(
                 .await;
         }
     }
+}
+
+fn sanitize_agent_error(raw: &str) -> String {
+    let lower = raw.to_lowercase();
+
+    if lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("429")
+        || lower.contains("too many requests")
+        || lower.contains("resource_exhausted")
+    {
+        return "Rate limit reached, please try again later.".to_string();
+    }
+
+    if lower.contains("authentication")
+        || lower.contains("unauthorized")
+        || lower.contains("invalid api key")
+        || lower.contains("invalid x-goog-api-key")
+        || lower.contains("incorrect api key")
+        || lower.contains("permission denied")
+        || lower.contains("billing")
+        || lower.contains("quota exceeded")
+    {
+        return "Service temporarily unavailable.".to_string();
+    }
+
+    if lower.contains("context length")
+        || lower.contains("token limit")
+        || lower.contains("too many tokens")
+        || lower.contains("maximum context")
+        || lower.contains("max_tokens")
+        || lower.contains("context window")
+    {
+        return "Message too long, try a shorter request.".to_string();
+    }
+
+    if lower.contains("overloaded")
+        || lower.contains("503")
+        || lower.contains("502")
+        || lower.contains("server error")
+        || lower.contains("internal error")
+    {
+        return "The AI service is temporarily overloaded, please try again shortly.".to_string();
+    }
+
+    if lower.contains("timeout") || lower.contains("timed out") || lower.contains("deadline") {
+        return "Request timed out, please try again.".to_string();
+    }
+
+    if lower.contains("model not found") || lower.contains("model_not_found") {
+        return "The requested model is currently unavailable.".to_string();
+    }
+
+    let cleaned = raw
+        .strip_prefix("LLM driver error: ")
+        .or_else(|| raw.strip_prefix("Agent error: "))
+        .unwrap_or(raw);
+
+    if let Some(first_sentence_end) = cleaned.find(". ") {
+        let first = &cleaned[..=first_sentence_end];
+        if first.len() < cleaned.len() / 2 {
+            return format!("Agent error: {first}");
+        }
+    }
+
+    if cleaned.contains('{') || cleaned.len() > 200 {
+        return "Something went wrong processing your request. Please try again.".to_string();
+    }
+
+    format!("Agent error: {cleaned}")
 }
 
 /// Detect image format from the first few magic bytes.
@@ -921,9 +1038,11 @@ async fn dispatch_with_blocks(
     handle: &Arc<dyn ChannelBridgeHandle>,
     router: &Arc<AgentRouter>,
     adapter: &dyn ChannelAdapter,
+    adapter_arc: &Arc<dyn ChannelAdapter>,
     ct_str: &str,
     thread_id: Option<&str>,
     output_format: OutputFormat,
+    lifecycle_reactions: bool,
 ) {
     // Route to agent (same logic as text path)
     let agent_id = router.resolve(
@@ -983,21 +1102,34 @@ async fn dispatch_with_blocks(
 
     // Lifecycle reaction: ⏳ Queued → 🤔 Thinking → ✅ Done / ❌ Error
     let msg_id = &message.platform_message_id;
-    send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Queued).await;
-    send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Thinking).await;
+    if lifecycle_reactions {
+        send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Queued).await;
+        send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Thinking).await;
+    }
 
-    match handle.send_message_with_blocks(agent_id, blocks).await {
+    // Continuous typing indicator (see spawn_typing_loop doc)
+    let typing_task = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
+
+    let result = handle.send_message_with_blocks(agent_id, blocks).await;
+
+    typing_task.abort();
+
+    match result {
         Ok(response) => {
-            send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Done).await;
+            if lifecycle_reactions {
+                send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Done).await;
+            }
             send_response(adapter, &message.sender, response, thread_id, output_format).await;
             handle
                 .record_delivery(agent_id, ct_str, &message.sender.platform_id, true, None, thread_id)
                 .await;
         }
         Err(e) => {
-            send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Error).await;
+            if lifecycle_reactions {
+                send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Error).await;
+            }
             warn!("Agent error for {agent_id}: {e}");
-            let err_msg = format!("Agent error: {e}");
+            let err_msg = sanitize_agent_error(&e.to_string());
             send_response(
                 adapter,
                 &message.sender,

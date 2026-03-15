@@ -8,7 +8,8 @@ use openfang_types::model_catalog::{
     BEDROCK_BASE_URL, CEREBRAS_BASE_URL, CHUTES_BASE_URL, COHERE_BASE_URL, DEEPSEEK_BASE_URL,
     FIREWORKS_BASE_URL, GEMINI_BASE_URL, GITHUB_COPILOT_BASE_URL, GROQ_BASE_URL,
     HUGGINGFACE_BASE_URL, KIMI_CODING_BASE_URL, LEMONADE_BASE_URL, LMSTUDIO_BASE_URL,
-    MINIMAX_BASE_URL, MISTRAL_BASE_URL, MOONSHOT_BASE_URL, OLLAMA_BASE_URL, OPENAI_BASE_URL,
+    MINIMAX_BASE_URL, MISTRAL_BASE_URL, MOONSHOT_BASE_URL, NVIDIA_NIM_BASE_URL, OLLAMA_BASE_URL,
+    OPENAI_BASE_URL,
     OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL, QWEN_BASE_URL,
     REPLICATE_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VENICE_BASE_URL, VLLM_BASE_URL,
     VOLCENGINE_BASE_URL, VOLCENGINE_CODING_BASE_URL, XAI_BASE_URL, ZAI_BASE_URL,
@@ -61,6 +62,15 @@ impl ModelCatalog {
             if provider.id == "claude-code" {
                 provider.auth_status =
                     if crate::drivers::claude_code::claude_code_available() {
+                        AuthStatus::Configured
+                    } else {
+                        AuthStatus::Missing
+                    };
+                continue;
+            }
+            if provider.id == "qwen-code" {
+                provider.auth_status =
+                    if crate::drivers::qwen_code::qwen_code_available() {
                         AuthStatus::Configured
                     } else {
                         AuthStatus::Missing
@@ -624,6 +634,16 @@ fn builtin_providers() -> Vec<ProviderInfo> {
             auth_status: AuthStatus::Missing,
             model_count: 0,
         },
+        // ── NVIDIA NIM ────────────────────────────────────────────────
+        ProviderInfo {
+            id: "nvidia".into(),
+            display_name: "NVIDIA NIM".into(),
+            api_key_env: "NVIDIA_API_KEY".into(),
+            base_url: NVIDIA_NIM_BASE_URL.into(),
+            key_required: true,
+            auth_status: AuthStatus::Missing,
+            model_count: 0,
+        },
         // ── Chinese providers (5) ────────────────────────────────────
         ProviderInfo {
             id: "qwen".into(),
@@ -755,6 +775,16 @@ fn builtin_providers() -> Vec<ProviderInfo> {
             auth_status: AuthStatus::NotRequired,
             model_count: 0,
         },
+        // ── Qwen Code CLI ──────────────────────────────────────────
+        ProviderInfo {
+            id: "qwen-code".into(),
+            display_name: "Qwen Code".into(),
+            api_key_env: String::new(),
+            base_url: String::new(),
+            key_required: false,
+            auth_status: AuthStatus::NotRequired,
+            model_count: 0,
+        },
     ]
 }
 
@@ -821,6 +851,8 @@ fn builtin_aliases() -> HashMap<String, String> {
         ("codex", "codex/gpt-4.1"),
         ("codex-4.1", "codex/gpt-4.1"),
         ("codex-o4", "codex/o4-mini"),
+        // NVIDIA NIM aliases
+        ("nemotron", "nvidia/llama-3.1-nemotron-70b-instruct"),
         // Venice aliases
         ("venice", "venice-uncensored"),
         // Claude Code aliases
@@ -828,6 +860,15 @@ fn builtin_aliases() -> HashMap<String, String> {
         ("claude-code-opus", "claude-code/opus"),
         ("claude-code-sonnet", "claude-code/sonnet"),
         ("claude-code-haiku", "claude-code/haiku"),
+        // Qwen Code aliases
+        ("qwen-code", "qwen-code/qwen3-coder"),
+        ("qwen-coder", "qwen-code/qwen3-coder"),
+        ("qwen-coder-plus", "qwen-code/qwen-coder-plus"),
+        ("qwq", "qwen-code/qwq-32b"),
+        // OpenRouter free-tier aliases
+        ("openrouter/free", "openrouter/meta-llama/llama-3.1-8b-instruct:free"),
+        ("free", "openrouter/meta-llama/llama-3.1-8b-instruct:free"),
+        ("free-reasoning", "openrouter/deepseek/deepseek-r1:free"),
     ];
     pairs
         .into_iter()
@@ -1738,6 +1779,20 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_streaming: true,
             aliases: vec![],
         },
+        ModelCatalogEntry {
+            id: "openrouter/hunter-alpha".into(),
+            display_name: "Hunter Alpha (OpenRouter)".into(),
+            provider: "openrouter".into(),
+            tier: ModelTier::Smart,
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec!["hunter-alpha".into()],
+        },
         // ══════════════════════════════════════════════════════════════
         // Mistral (6)
         // ══════════════════════════════════════════════════════════════
@@ -2012,6 +2067,79 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_vision: false,
             supports_streaming: true,
             aliases: vec![],
+        },
+        // ══════════════════════════════════════════════════════════════
+        // NVIDIA NIM (5)
+        // ══════════════════════════════════════════════════════════════
+        ModelCatalogEntry {
+            id: "nvidia/llama-3.1-nemotron-70b-instruct".into(),
+            display_name: "Nemotron 70B Instruct (NVIDIA NIM)".into(),
+            provider: "nvidia".into(),
+            tier: ModelTier::Smart,
+            context_window: 128_000,
+            max_output_tokens: 4_096,
+            input_cost_per_m: 0.88,
+            output_cost_per_m: 0.88,
+            supports_tools: true,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec!["nemotron-70b".into()],
+        },
+        ModelCatalogEntry {
+            id: "meta/llama-3.1-405b-instruct".into(),
+            display_name: "Llama 3.1 405B Instruct (NVIDIA NIM)".into(),
+            provider: "nvidia".into(),
+            tier: ModelTier::Frontier,
+            context_window: 128_000,
+            max_output_tokens: 4_096,
+            input_cost_per_m: 5.00,
+            output_cost_per_m: 16.00,
+            supports_tools: true,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            id: "meta/llama-3.1-70b-instruct".into(),
+            display_name: "Llama 3.1 70B Instruct (NVIDIA NIM)".into(),
+            provider: "nvidia".into(),
+            tier: ModelTier::Balanced,
+            context_window: 128_000,
+            max_output_tokens: 4_096,
+            input_cost_per_m: 0.88,
+            output_cost_per_m: 0.88,
+            supports_tools: true,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            id: "mistralai/mistral-large-latest".into(),
+            display_name: "Mistral Large (NVIDIA NIM)".into(),
+            provider: "nvidia".into(),
+            tier: ModelTier::Smart,
+            context_window: 128_000,
+            max_output_tokens: 4_096,
+            input_cost_per_m: 2.00,
+            output_cost_per_m: 6.00,
+            supports_tools: true,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            id: "nvidia/nemotron-4-340b-instruct".into(),
+            display_name: "Nemotron 4 340B Instruct (NVIDIA NIM)".into(),
+            provider: "nvidia".into(),
+            tier: ModelTier::Frontier,
+            context_window: 4_096,
+            max_output_tokens: 4_096,
+            input_cost_per_m: 4.20,
+            output_cost_per_m: 4.20,
+            supports_tools: true,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec!["nemotron-340b".into()],
         },
         // ══════════════════════════════════════════════════════════════
         // Ollama (6) — local, no key required + dynamic discovery
@@ -3416,6 +3544,51 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             aliases: vec!["claude-code-haiku".into()],
         },
         // ══════════════════════════════════════════════════════════════
+        // Qwen Code CLI (3) — subprocess-based, free via Qwen OAuth
+        // ══════════════════════════════════════════════════════════════
+        ModelCatalogEntry {
+            id: "qwen-code/qwen-coder-plus".into(),
+            display_name: "Qwen Coder Plus (CLI)".into(),
+            provider: "qwen-code".into(),
+            tier: ModelTier::Frontier,
+            context_window: 131_072,
+            max_output_tokens: 65_536,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: false,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec!["qwen-coder-plus".into()],
+        },
+        ModelCatalogEntry {
+            id: "qwen-code/qwen3-coder".into(),
+            display_name: "Qwen3 Coder (CLI)".into(),
+            provider: "qwen-code".into(),
+            tier: ModelTier::Smart,
+            context_window: 131_072,
+            max_output_tokens: 65_536,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: false,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec!["qwen-code".into(), "qwen-coder".into()],
+        },
+        ModelCatalogEntry {
+            id: "qwen-code/qwq-32b".into(),
+            display_name: "QwQ 32B (CLI)".into(),
+            provider: "qwen-code".into(),
+            tier: ModelTier::Balanced,
+            context_window: 131_072,
+            max_output_tokens: 65_536,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: false,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec!["qwq".into()],
+        },
+        // ══════════════════════════════════════════════════════════════
         // Chutes.ai (5)
         // ══════════════════════════════════════════════════════════════
         ModelCatalogEntry {
@@ -3549,7 +3722,7 @@ mod tests {
     #[test]
     fn test_catalog_has_providers() {
         let catalog = ModelCatalog::new();
-        assert_eq!(catalog.list_providers().len(), 38);
+        assert_eq!(catalog.list_providers().len(), 40);
     }
 
     #[test]
@@ -3916,5 +4089,30 @@ mod tests {
         let catalog = ModelCatalog::new();
         let entry = catalog.find_model("claude-code").unwrap();
         assert_eq!(entry.id, "claude-code/sonnet");
+    }
+
+    #[test]
+    fn test_qwen_code_provider() {
+        let catalog = ModelCatalog::new();
+        let qc = catalog.get_provider("qwen-code").unwrap();
+        assert_eq!(qc.display_name, "Qwen Code");
+        assert!(!qc.key_required);
+    }
+
+    #[test]
+    fn test_qwen_code_models() {
+        let catalog = ModelCatalog::new();
+        let models = catalog.models_by_provider("qwen-code");
+        assert_eq!(models.len(), 3);
+        assert!(models.iter().any(|m| m.id == "qwen-code/qwen3-coder"));
+        assert!(models.iter().any(|m| m.id == "qwen-code/qwen-coder-plus"));
+        assert!(models.iter().any(|m| m.id == "qwen-code/qwq-32b"));
+    }
+
+    #[test]
+    fn test_qwen_code_aliases() {
+        let catalog = ModelCatalog::new();
+        let entry = catalog.find_model("qwen-code").unwrap();
+        assert_eq!(entry.id, "qwen-code/qwen3-coder");
     }
 }
