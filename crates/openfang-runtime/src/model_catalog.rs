@@ -5,11 +5,11 @@
 
 use openfang_types::model_catalog::{
     AuthStatus, ModelCatalogEntry, ModelTier, ProviderInfo, AI21_BASE_URL, ANTHROPIC_BASE_URL,
-    BEDROCK_BASE_URL, CEREBRAS_BASE_URL, CHUTES_BASE_URL, COHERE_BASE_URL, DEEPSEEK_BASE_URL,
-    FIREWORKS_BASE_URL, GEMINI_BASE_URL, GITHUB_COPILOT_BASE_URL, GROQ_BASE_URL,
-    HUGGINGFACE_BASE_URL, KIMI_CODING_BASE_URL, LEMONADE_BASE_URL, LMSTUDIO_BASE_URL,
-    MINIMAX_BASE_URL, MISTRAL_BASE_URL, MOONSHOT_BASE_URL, NVIDIA_NIM_BASE_URL, OLLAMA_BASE_URL,
-    OPENAI_BASE_URL,
+    AZURE_OPENAI_BASE_URL, BEDROCK_BASE_URL, CEREBRAS_BASE_URL, CHUTES_BASE_URL,
+    COHERE_BASE_URL, DEEPSEEK_BASE_URL, FIREWORKS_BASE_URL, GEMINI_BASE_URL,
+    GITHUB_COPILOT_BASE_URL, GROQ_BASE_URL, HUGGINGFACE_BASE_URL, KIMI_CODING_BASE_URL,
+    LEMONADE_BASE_URL, LMSTUDIO_BASE_URL, MINIMAX_BASE_URL, MISTRAL_BASE_URL,
+    MOONSHOT_BASE_URL, NVIDIA_NIM_BASE_URL, OLLAMA_BASE_URL, OPENAI_BASE_URL,
     OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL, QWEN_BASE_URL,
     REPLICATE_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VENICE_BASE_URL, VLLM_BASE_URL,
     VOLCENGINE_BASE_URL, VOLCENGINE_CODING_BASE_URL, XAI_BASE_URL, ZAI_BASE_URL,
@@ -60,21 +60,19 @@ impl ModelCatalog {
             // Claude Code is special: no API key needed, but we probe for CLI
             // installation so the dashboard shows "Configured" vs "Not Installed".
             if provider.id == "claude-code" {
-                provider.auth_status =
-                    if crate::drivers::claude_code::claude_code_available() {
-                        AuthStatus::Configured
-                    } else {
-                        AuthStatus::Missing
-                    };
+                provider.auth_status = if crate::drivers::claude_code::claude_code_available() {
+                    AuthStatus::Configured
+                } else {
+                    AuthStatus::Missing
+                };
                 continue;
             }
             if provider.id == "qwen-code" {
-                provider.auth_status =
-                    if crate::drivers::qwen_code::qwen_code_available() {
-                        AuthStatus::Configured
-                    } else {
-                        AuthStatus::Missing
-                    };
+                provider.auth_status = if crate::drivers::qwen_code::qwen_code_available() {
+                    AuthStatus::Configured
+                } else {
+                    AuthStatus::Missing
+                };
                 continue;
             }
 
@@ -90,8 +88,7 @@ impl ModelCatalog {
             let has_fallback = match provider.id.as_str() {
                 "gemini" => std::env::var("GOOGLE_API_KEY").is_ok(),
                 "codex" => {
-                    std::env::var("OPENAI_API_KEY").is_ok()
-                        || read_codex_credential().is_some()
+                    std::env::var("OPENAI_API_KEY").is_ok() || read_codex_credential().is_some()
                 }
                 // claude-code is handled above (before key_required check)
                 _ => false,
@@ -403,6 +400,7 @@ pub fn read_codex_credential() -> Option<String> {
     parsed
         .get("api_key")
         .or_else(|| parsed.get("token"))
+        .or_else(|| parsed.get("tokens").and_then(|t| t.get("id_token")))
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
@@ -755,6 +753,16 @@ fn builtin_providers() -> Vec<ProviderInfo> {
             auth_status: AuthStatus::Missing,
             model_count: 0,
         },
+        // ── Azure OpenAI ───────────────────────────────────────────
+        ProviderInfo {
+            id: "azure".into(),
+            display_name: "Azure OpenAI".into(),
+            api_key_env: "AZURE_OPENAI_API_KEY".into(),
+            base_url: AZURE_OPENAI_BASE_URL.into(),
+            key_required: true,
+            auth_status: AuthStatus::Missing,
+            model_count: 0,
+        },
         // ── OpenAI Codex ────────────────────────────────────────────
         ProviderInfo {
             id: "codex".into(),
@@ -848,7 +856,8 @@ fn builtin_aliases() -> HashMap<String, String> {
         ("minimax-m2.1", "MiniMax-M2.1"),
         ("codegeex", "codegeex-4"),
         // Codex aliases
-        ("codex", "codex/gpt-4.1"),
+        ("codex", "codex/gpt-5.4"),
+        ("codex-5.4", "codex/gpt-5.4"),
         ("codex-4.1", "codex/gpt-4.1"),
         ("codex-o4", "codex/o4-mini"),
         // NVIDIA NIM aliases
@@ -866,7 +875,10 @@ fn builtin_aliases() -> HashMap<String, String> {
         ("qwen-coder-plus", "qwen-code/qwen-coder-plus"),
         ("qwq", "qwen-code/qwq-32b"),
         // OpenRouter free-tier aliases
-        ("openrouter/free", "openrouter/meta-llama/llama-3.1-8b-instruct:free"),
+        (
+            "openrouter/free",
+            "openrouter/meta-llama/llama-3.1-8b-instruct:free",
+        ),
         ("free", "openrouter/meta-llama/llama-3.1-8b-instruct:free"),
         ("free-reasoning", "openrouter/deepseek/deepseek-r1:free"),
     ];
@@ -1405,6 +1417,67 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             output_cost_per_m: 1.10,
             supports_tools: true,
             supports_vision: false,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        // ══════════════════════════════════════════════════════════════
+        // Azure OpenAI (4)
+        // These represent common Azure deployment names. Users deploy models
+        // under their own deployment names, so these are illustrative defaults.
+        // ══════════════════════════════════════════════════════════════
+        ModelCatalogEntry {
+            id: "azure/gpt-4o".into(),
+            display_name: "GPT-4o (Azure)".into(),
+            provider: "azure".into(),
+            tier: ModelTier::Smart,
+            context_window: 128_000,
+            max_output_tokens: 16_384,
+            input_cost_per_m: 2.50,
+            output_cost_per_m: 10.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            id: "azure/gpt-4o-mini".into(),
+            display_name: "GPT-4o Mini (Azure)".into(),
+            provider: "azure".into(),
+            tier: ModelTier::Fast,
+            context_window: 128_000,
+            max_output_tokens: 16_384,
+            input_cost_per_m: 0.15,
+            output_cost_per_m: 0.60,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            id: "azure/gpt-4.1".into(),
+            display_name: "GPT-4.1 (Azure)".into(),
+            provider: "azure".into(),
+            tier: ModelTier::Frontier,
+            context_window: 1_047_576,
+            max_output_tokens: 32_768,
+            input_cost_per_m: 2.00,
+            output_cost_per_m: 8.00,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            id: "azure/gpt-4.1-mini".into(),
+            display_name: "GPT-4.1 Mini (Azure)".into(),
+            provider: "azure".into(),
+            tier: ModelTier::Fast,
+            context_window: 1_047_576,
+            max_output_tokens: 32_768,
+            input_cost_per_m: 0.40,
+            output_cost_per_m: 1.60,
+            supports_tools: true,
+            supports_vision: true,
             supports_streaming: true,
             aliases: vec![],
         },
@@ -3471,6 +3544,20 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
         // OpenAI Codex (2) — reuses OpenAI driver
         // ══════════════════════════════════════════════════════════════
         ModelCatalogEntry {
+            id: "codex/gpt-5.4".into(),
+            display_name: "GPT-5.4 (Codex)".into(),
+            provider: "codex".into(),
+            tier: ModelTier::Frontier,
+            context_window: 1_047_576,
+            max_output_tokens: 32_768,
+            input_cost_per_m: 2.00,
+            output_cost_per_m: 8.00,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec!["codex".into(), "codex-5.4".into()],
+        },
+        ModelCatalogEntry {
             id: "codex/gpt-4.1".into(),
             display_name: "GPT-4.1 (Codex)".into(),
             provider: "codex".into(),
@@ -3482,7 +3569,7 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_tools: true,
             supports_vision: true,
             supports_streaming: true,
-            aliases: vec!["codex".into(), "codex-4.1".into()],
+            aliases: vec!["codex-4.1".into()],
         },
         ModelCatalogEntry {
             id: "codex/o4-mini".into(),
@@ -3722,7 +3809,7 @@ mod tests {
     #[test]
     fn test_catalog_has_providers() {
         let catalog = ModelCatalog::new();
-        assert_eq!(catalog.list_providers().len(), 40);
+        assert_eq!(catalog.list_providers().len(), 41);
     }
 
     #[test]
@@ -3757,10 +3844,7 @@ mod tests {
     #[test]
     fn test_resolve_alias() {
         let catalog = ModelCatalog::new();
-        assert_eq!(
-            catalog.resolve_alias("sonnet"),
-            Some("claude-sonnet-4-6")
-        );
+        assert_eq!(catalog.resolve_alias("sonnet"), Some("claude-sonnet-4-6"));
         assert_eq!(
             catalog.resolve_alias("haiku"),
             Some("claude-haiku-4-5-20251001")
@@ -4054,7 +4138,8 @@ mod tests {
     fn test_codex_models() {
         let catalog = ModelCatalog::new();
         let models = catalog.models_by_provider("codex");
-        assert_eq!(models.len(), 2);
+        assert_eq!(models.len(), 3);
+        assert!(models.iter().any(|m| m.id == "codex/gpt-5.4"));
         assert!(models.iter().any(|m| m.id == "codex/gpt-4.1"));
         assert!(models.iter().any(|m| m.id == "codex/o4-mini"));
     }
@@ -4063,7 +4148,7 @@ mod tests {
     fn test_codex_aliases() {
         let catalog = ModelCatalog::new();
         let entry = catalog.find_model("codex").unwrap();
-        assert_eq!(entry.id, "codex/gpt-4.1");
+        assert_eq!(entry.id, "codex/gpt-5.4");
     }
 
     #[test]
@@ -4114,5 +4199,37 @@ mod tests {
         let catalog = ModelCatalog::new();
         let entry = catalog.find_model("qwen-code").unwrap();
         assert_eq!(entry.id, "qwen-code/qwen3-coder");
+    }
+
+    #[test]
+    fn test_azure_provider_in_catalog() {
+        let catalog = ModelCatalog::new();
+        let azure = catalog.get_provider("azure").unwrap();
+        assert_eq!(azure.display_name, "Azure OpenAI");
+        assert_eq!(azure.api_key_env, "AZURE_OPENAI_API_KEY");
+        assert!(azure.key_required);
+        assert!(azure.base_url.is_empty()); // user must supply their own
+    }
+
+    #[test]
+    fn test_azure_models() {
+        let catalog = ModelCatalog::new();
+        let models = catalog.models_by_provider("azure");
+        assert_eq!(models.len(), 4);
+        assert!(models.iter().any(|m| m.id == "azure/gpt-4o"));
+        assert!(models.iter().any(|m| m.id == "azure/gpt-4o-mini"));
+        assert!(models.iter().any(|m| m.id == "azure/gpt-4.1"));
+        assert!(models.iter().any(|m| m.id == "azure/gpt-4.1-mini"));
+    }
+
+    #[test]
+    fn test_azure_model_lookup() {
+        let catalog = ModelCatalog::new();
+        let entry = catalog.find_model("azure/gpt-4o").unwrap();
+        assert_eq!(entry.provider, "azure");
+        assert_eq!(entry.display_name, "GPT-4o (Azure)");
+        assert_eq!(entry.tier, ModelTier::Smart);
+        assert!(entry.supports_tools);
+        assert!(entry.supports_vision);
     }
 }
