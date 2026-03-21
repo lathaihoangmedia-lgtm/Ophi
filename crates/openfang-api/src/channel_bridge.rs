@@ -1025,7 +1025,8 @@ fn read_token(env_var_or_token: &str, adapter_name: &str) -> Option<String> {
         || env_var_or_token.starts_with("xoxb-")
         || env_var_or_token.starts_with("xapp-")
         || env_var_or_token.starts_with("sk-")
-        || env_var_or_token.starts_with("Bearer ");
+        || env_var_or_token.starts_with("Bearer ")
+        || env_var_or_token.len() > 80; // Long random strings are tokens, not env var names
 
     if looks_like_token {
         warn!(
@@ -1218,6 +1219,7 @@ pub async fn start_channel_bridge_with_config(
                 mx_config.user_id.clone(),
                 token,
                 mx_config.allowed_rooms.clone(),
+                mx_config.auto_accept_invites,
             ));
             adapters.push((adapter, mx_config.default_agent.clone()));
         }

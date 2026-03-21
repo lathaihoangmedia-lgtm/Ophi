@@ -1085,7 +1085,11 @@ impl OpenFangKernel {
                                             || disk_manifest.model.model
                                                 != entry.manifest.model.model
                                             || disk_manifest.capabilities.tools
-                                                != entry.manifest.capabilities.tools;
+                                                != entry.manifest.capabilities.tools
+                                            || disk_manifest.tool_allowlist
+                                                != entry.manifest.tool_allowlist
+                                            || disk_manifest.tool_blocklist
+                                                != entry.manifest.tool_blocklist;
                                         if changed {
                                             info!(
                                                 agent = %name,
@@ -1254,15 +1258,17 @@ impl OpenFangKernel {
         fixed_id: Option<AgentId>,
     ) -> KernelResult<AgentId> {
         let agent_id = fixed_id.unwrap_or_default();
-        let session_id = SessionId::new();
         let name = manifest.name.clone();
 
         info!(agent = %name, id = %agent_id, parent = ?parent, "Spawning agent");
 
-        // Create session
-        self.memory
+        // Create session — use the returned session_id so the registry
+        // and database are in sync (fixes duplicate session bug #651).
+        let session = self
+            .memory
             .create_session(agent_id)
             .map_err(KernelError::OpenFang)?;
+        let session_id = session.id;
 
         // Inherit kernel exec_policy as fallback if agent manifest doesn't have one
         let mut manifest = manifest;
@@ -1303,6 +1309,30 @@ impl OpenFangKernel {
                     manifest.model.base_url.clone_from(&dm.base_url);
                 }
             }
+        }
+
+        // Normalize catalog-backed model labels/aliases into canonical IDs and
+        // fill provider/auth hints when the manifest did not fully specify them.
+        if let Ok(catalog) = self.model_catalog.read() {
+            if let Some(entry) = catalog.find_model(&manifest.model.model) {
+                let provider_is_default =
+                    manifest.model.provider.is_empty() || manifest.model.provider == "default";
+                if provider_is_default || manifest.model.provider == entry.provider {
+                    manifest.model.provider = entry.provider.clone();
+                    manifest.model.model = strip_provider_prefix(&entry.id, &entry.provider);
+                    if manifest.model.api_key_env.is_none() {
+                        manifest.model.api_key_env =
+                            Some(self.config.resolve_api_key_env(&entry.provider));
+                    }
+                }
+            }
+        }
+        if manifest.model.api_key_env.is_none()
+            && !manifest.model.provider.is_empty()
+            && manifest.model.provider != "default"
+        {
+            manifest.model.api_key_env =
+                Some(self.config.resolve_api_key_env(&manifest.model.provider));
         }
 
         // Normalize: strip provider prefix from model name if present
@@ -1599,6 +1629,7 @@ impl OpenFangKernel {
         kernel_handle: Option<Arc<dyn KernelHandle>>,
         sender_id: Option<String>,
         sender_name: Option<String>,
+        content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
     ) -> KernelResult<(
         tokio::sync::mpsc::Receiver<StreamEvent>,
         tokio::task::JoinHandle<KernelResult<AgentLoopResult>>,
@@ -1954,7 +1985,7 @@ impl OpenFangKernel {
                 Some(&kernel_clone.hooks),
                 ctx_window,
                 Some(&kernel_clone.process_manager),
-                None, // content_blocks (streaming path uses text only for now)
+                content_blocks,
             )
             .await;
 
@@ -2825,6 +2856,11 @@ impl OpenFangKernel {
         model: &str,
         explicit_provider: Option<&str>,
     ) -> KernelResult<()> {
+        let catalog_entry = self
+            .model_catalog
+            .read()
+            .ok()
+            .and_then(|catalog| catalog.find_model(model).cloned());
         let provider = if let Some(ep) = explicit_provider {
             // User explicitly set the provider — use it as-is
             Some(ep.to_string())
@@ -2843,25 +2879,35 @@ impl OpenFangKernel {
                 None
             } else {
                 // No custom base_url: safe to auto-detect from catalog / model name
-                let resolved_provider = self.model_catalog.read().ok().and_then(|catalog| {
-                    catalog
-                        .find_model(model)
-                        .map(|entry| entry.provider.clone())
-                });
+                let resolved_provider = catalog_entry.as_ref().map(|entry| entry.provider.clone());
                 resolved_provider.or_else(|| infer_provider_from_model(model))
             }
         };
 
         // Strip the provider prefix from the model name (e.g. "openrouter/deepseek/deepseek-chat" → "deepseek/deepseek-chat")
-        let normalized_model = if let Some(ref prov) = provider {
-            strip_provider_prefix(model, prov)
-        } else {
-            model.to_string()
-        };
+        let normalized_model =
+            if let (Some(entry), Some(prov)) = (catalog_entry.as_ref(), provider.as_ref()) {
+                if entry.provider == *prov {
+                    strip_provider_prefix(&entry.id, prov)
+                } else {
+                    strip_provider_prefix(model, prov)
+                }
+            } else if let Some(ref prov) = provider {
+                strip_provider_prefix(model, prov)
+            } else {
+                model.to_string()
+            };
 
         if let Some(provider) = provider {
+            let api_key_env = Some(self.config.resolve_api_key_env(&provider));
             self.registry
-                .update_model_and_provider(agent_id, normalized_model.clone(), provider.clone())
+                .update_model_provider_config(
+                    agent_id,
+                    normalized_model.clone(),
+                    provider.clone(),
+                    api_key_env,
+                    None,
+                )
                 .map_err(KernelError::OpenFang)?;
             info!(agent_id = %agent_id, model = %normalized_model, provider = %provider, "Agent model+provider updated");
         } else {
@@ -4572,6 +4618,9 @@ impl OpenFangKernel {
         if let Err(e) = resolver.remove_from_vault(key) {
             debug!("Vault remove skipped for {key}: {e}");
         }
+        // Also clear from the in-memory dotenv cache so the resolver
+        // doesn't return a stale value from the boot-time snapshot (#736).
+        resolver.clear_dotenv_cache(key);
     }
 
     fn lookup_provider_url(&self, provider: &str) -> Option<String> {
@@ -4737,6 +4786,17 @@ impl OpenFangKernel {
                 },
                 McpTransportEntry::Sse { url } => McpTransport::Sse { url: url.clone() },
             };
+
+            // Resolve env vars from vault/dotenv before passing to MCP subprocess.
+            // The MCP spawn calls env_clear() then re-adds only whitelisted vars
+            // from std::env — so we must ensure they're in std::env first.
+            for var_name in &server_config.env {
+                if std::env::var(var_name).is_err() {
+                    if let Some(val) = self.resolve_credential(var_name) {
+                        std::env::set_var(var_name, &val);
+                    }
+                }
+            }
 
             let mcp_config = McpServerConfig {
                 name: server_config.name.clone(),
